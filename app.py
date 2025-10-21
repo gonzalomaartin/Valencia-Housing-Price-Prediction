@@ -1,71 +1,126 @@
-import pandas as pd 
-import joblib 
+import pandas as pd
+import joblib
 import numpy as np
-from typing import Optional, Annotated 
-from fastapi import FastAPI, Request, Form, HTTPException
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
+from data_preprocessor import clean_data
+from xgboost import XGBRegressor
+from contextlib import asynccontextmanager
 
+# Model paths
+XGBOOST_MODEL_PATH = "inference/models/xgboost.pkl"
+KMEANS_MODEL_PATH = "inference/models/kmeans.joblib"
+GLOBAL_MEAN_PATH = "inference/global_mean.pkl"
+CLUSTER_PRICE_STATS_PATH = "inference/cluster_price_stats.pkl"
+CLUSTER_LUXURY_MEAN_PATH = "inference/cluster_luxury_mean.pkl"
+PREMIUM_LOCATION_THRESHOLD_PATH = "inference/premium_location_threshold.pkl"
+
+
+xgb_model = joblib.load(XGBOOST_MODEL_PATH)
+global_mean = joblib.load(GLOBAL_MEAN_PATH)
+kmeans_model = joblib.load(KMEANS_MODEL_PATH)
+cluster_price_stats = joblib.load(CLUSTER_PRICE_STATS_PATH)
+cluster_luxury_mean = joblib.load(CLUSTER_LUXURY_MEAN_PATH)
+premium_location_threshold = joblib.load(PREMIUM_LOCATION_THRESHOLD_PATH)
+
+# Load models on startup
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.xgb_model = joblib.load(XGBOOST_MODEL_PATH)
+    app.state.global_mean = joblib.load(GLOBAL_MEAN_PATH)
+    app.state.kmeans_model = joblib.load(KMEANS_MODEL_PATH)
+    app.state.cluster_price_stats = joblib.load(CLUSTER_PRICE_STATS_PATH)
+    app.state.cluster_luxury_mean = joblib.load(CLUSTER_LUXURY_MEAN_PATH)
+    app.state.premium_location_threshold = joblib.load(PREMIUM_LOCATION_THRESHOLD_PATH)
+    yield
 
 app = FastAPI(
     title="Idealista Property Price Predictor",
-    description="Machine learning API for predicting property prices in Spain based on Idealista data",
+    description="Predicts property prices using an XGBoost model",
+    lifespan=lifespan,
 )
 
-app.mount("/static", StaticFiles(directory = "static"), name="static")
-templates = Jinja2Templates(directory = "templates")
+# Allow React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8080", "*"],  #["*"] for all origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class FormData(BaseModel): 
-    # Basic measurements - required fields
-    rooms: int
-    baths: int
-    m2_cons: float
-    
-    # Basic measurements - optional fields (can be None)
-    m2_property: Optional[float] = None
-    floor: Optional[int] = None
-    year_built: Optional[int] = None
-    
-    # Location address
-    address: Optional[str] = None  # Full address from geocoding or user selection
-    
-    # Property type & condition
-    property_type: str = "piso"  # piso, atico, duplex, estudio, chalet, adosado, pareado, villa, masia, casa_rustica
-    condition: str = "good"  # new, good, renovate
-    
-    # Orientation
-    east: bool = False
-    north: bool = False
-    south: bool = False
-    west: bool = False
-    
+print("App is starting...", flush=True)
+
+@app.get("/ping")
+def ping():
+    print("Ping endpoint called", flush=True)
+    return {"message": "pong"}
+
+# Input model
+class PropertyData(BaseModel):
+    propertyType: str
+    rooms: str
+    bathrooms: str
+    m2Cons: str
+    condition: str
+    coordinates: List[Optional[float]] = [None, None]
+    yearBuilt: str = ""
+    m2Property: str = ""
+    floor: str = ""
+    address: str = ""
+    # Orientations
+    orientationEast: bool = False
+    orientationNorth: bool = False
+    orientationSouth: bool = False
+    orientationWest: bool = False
     # Amenities
-    garage: bool = False
-    lift: bool = False
-    AC: bool = False
-    heating: bool = False
-    balcony: bool = False
-    terrace: bool = False
-    pool: bool = False
-    garden: bool = False
-    wardrobes: bool = False
-    trastero: bool = False
-    fireplace: bool = False
-    mobility: bool = False
-    
-    # Special features & status
-    sea_views: bool = False
-    nuda: bool = False
-    ocupada: bool = False
+    hasGarage: bool = False
+    hasLift: bool = False
+    hasAC: bool = False
+    hasBalcony: bool = False
+    hasHeating: bool = False
+    hasTerrace: bool = False
+    hasPool: bool = False
+    hasGarden: bool = False
+    hasBuiltInWardrobes: bool = False
+    hasStorageRoom: bool = False
+    hasFireplace: bool = False
+    hasWheelchairAccessible: bool = False
+    # Additional details
+    garagePrice: str = ""
+    seaViews: bool = False
+    nudeProperty: bool = False
     rented: bool = False
+    occupied: bool = False
+    # Energy ratings
+    energyConsumption: str = ""
+    emissions: str = ""
 
-
-
-@app.get("/")
-def landing_page(): 
+# Prediction endpoint
+@app.post("/predict")
+def process_data(data: PropertyData, request: Request):
+    try:
+        # Convert to DataFrame
+        input_dict = data.model_dump()
+        print(f"Data: {input_dict}")
+        df = pd.DataFrame([input_dict])
     
+        # Clean data
+        df_clean = clean_data(df, state=request.app.state)
+        expected_columns = xgb_model.get_booster().feature_names
+        df_clean = df_clean[expected_columns] #Getting the exact order 
 
-@app.post("/submit")
-def get_data(data: Annotated[FormData, Form()]): 
-    return data
+        # Predict
+        model = request.app.state.xgb_model
+        prediction_log = model.predict(df_clean)[0]
+        prediction = np.exp(prediction_log).round().astype(int)
+        print(prediction)
+
+        return {"predicted_price": int(prediction)}
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=501, detail=f"{str(e)}\n{tb}")

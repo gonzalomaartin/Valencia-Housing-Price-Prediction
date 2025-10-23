@@ -53,11 +53,6 @@ app.add_middleware(
 
 print("App is starting...", flush=True)
 
-@app.get("/ping")
-def ping():
-    print("Ping endpoint called", flush=True)
-    return {"message": "pong"}
-
 # Input model
 class PropertyData(BaseModel):
     propertyType: str
@@ -97,6 +92,10 @@ class PropertyData(BaseModel):
     # Energy ratings
     energyConsumption: str = ""
     emissions: str = ""
+
+@app.get("/")
+def landing_page(): 
+    return {"Usage": "Perform a POST request to /predict to get a price prediction"}
 
 # Prediction endpoint
 @app.post("/predict")
